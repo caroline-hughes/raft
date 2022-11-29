@@ -1,0 +1,180 @@
+#!/usr/bin/env python3
+
+import argparse, socket, time, json, select, struct, sys, math, os, random
+import enum
+
+BROADCAST = "FFFF"
+HEARTBEAT_PERIOD = 140 # leader should send heartbeat every 140ms
+REPLICAS = 5
+# TIMEOUT_RANGE = [150, 300, 30]  # replicas will have a randomly assigned timeout from this fixed interval, staggered by 30
+
+class State(enum):
+    FOLLOWER = 0
+    CANDIDATE = 1
+    LEADER = 2
+
+class Replica:
+    term = 0
+    state = State.FOLLOWER
+    log = []        # list of lists, where each is an entry in the form [term, k, v]
+    data = None     # dict of (k, v) pairs
+    leader_id = None
+    timer_start = None
+
+    my_voters = []              # our votees (if we are a candidate)
+    voted_for = None            # candidate we voted for
+    timeout_threshold = None    # our randomly assigned timeout threshold within [150, 300]
+
+    # leader field:
+    time_last_msg_sent = None  # time since our last message (heartbeat or get/put)
+
+    def __init__(self, port, id, others):
+        self.port = port
+        self.id = id
+        self.others = others
+
+        self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.socket.bind(('localhost', 0))
+
+        print("Replica %s starting up" % self.id, flush=True)
+        hello = { "src": self.id, "dst": BROADCAST, "leader": BROADCAST, "type": "hello" }
+        self.send(hello)
+        print("Sent hello message: %s" % hello, flush=True)
+
+        # assign self a timeout threshold in 150–300ms
+        self.timeout_threshold = random.randrange(150, 300, 30)
+        self.timer_start = time.time()
+
+    def send(self, message):
+        print("Sent message: %s" % message, flush=True)
+        self.socket.sendto(json.dumps(message).encode('utf-8'), ('localhost', self.port))
+
+    # recieved a RequestVote RPC
+    def got_request_vote(self, json_msg):
+        src = json_msg['src']
+        valid = True
+
+        # is their term >= ours?
+        if json_msg['term'] < self.term:
+            valid = False
+
+        # is their log up to date with ours?
+        src_last_i = json_msg['last_i']
+        src_last_term = json_msg['last_term'] # is a [term, k, v]
+        if src_last_term < self.log[len(self.log) - 1][0]:
+            valid = False
+        if src_last_i < len(self.log) - 1:
+            valid = False
+        
+        # have we already voted?
+        if self.voted_for is not None:
+            valid = False
+
+        vote = 'true' if valid else 'false'
+
+        votemsg = { 
+            "src": self.id, 
+            "dst": src,
+            "leader": BROADCAST, 
+            "type": "vote", 
+            "vote": vote,
+            "cand_id": src, 
+        }
+        self.voted_for = src
+        self.send(votemsg)
+
+    # if we arent the leader, check whether the leader has died
+    def check_leader_timeout(self):
+        if time.time() > (self.timer_start + self.timeout_threshold):
+            # send RequestVote RPC
+            self.term += 1
+            rv = { 
+                "src": self.id, 
+                "dst": BROADCAST, 
+                "leader": BROADCAST, 
+                "type": "rv", 
+                "term": self.term, 
+                "last_i": len(self.log) - 1, # index of last thing in log 
+                "last_term": self.log[len(self.log) - 1][0] # term of last thing in log
+            }
+            self.voted_for = self.id
+            self.send(rv)
+            self.state = State.CANDIDATE
+
+    # if we are the leader, check whether we need to send a heartbeat message
+    def check_heartbeat(self):
+        if time.time() > self.time_last_msg_sent + HEARTBEAT_PERIOD:
+            self.heartbeat()
+
+    # send AppendEntries RPCs to all replica followers
+    def heartbeat(self):
+        ae = { 
+            "src": self.id, 
+            "dst": BROADCAST, 
+            "leader": self.id, 
+            "type": "ae", 
+            "term": self.term,
+            "prev_log_i": len(self.log) - 1,
+            "prev_log_term": self.log[len(self.log) - 1][0],
+            "entries": [], # empty for heartbeat
+            "commit": len(self.log) - 1 # for heartbeat, commit = prev_log_i ?
+            }
+        self.send(ae)
+        self.time_of_last_msg = time.time()
+
+    # if we are a candidate, parse the vote someone casted for us
+    def got_vote(self, msg):
+        vote = msg['vote']
+        src = msg['src']
+        if vote == 'true' and (src not in self.my_voters):
+            self.my_voters.append(src)
+            # if we have a majority, we are now the leader
+            if len(self.my_voters) >= 3: 
+                self.state = State.LEADER
+                self.heartbeat()
+        # else? do we need to do something if someone doesnt vote for us
+
+    def run(self):
+        while True:
+            # Check for various timeouts, depending on state
+            if self.state != State.LEADER:
+                self.check_leader_timeout()
+            if self.state == State.LEADER:
+                self.check_heartbeat()
+
+            # Listen for messages
+            data, addr = self.socket.recvfrom(65535) 
+            msg = json.loads(data.decode('utf-8'))
+            # print("Received message '%s'" % (data.decode('utf-8'),), flush=True)
+            mtype = msg['type']
+            src = msg['src']
+
+            # Perform logic based on type of message
+
+            # check if someone elected themself as a candidate
+            if mtype == "rv":
+                self.got_request_vote(msg)
+
+            # check if we got votes, if we are a candidate
+            if mtype == "vote" and self.state == State.CANDIDATE:
+                self.got_vote(msg)
+
+            # (old work when we responded to everything with fail msg)
+            # res = { "src": self.id, "dst": src, "leader": BROADCAST, "type": "fail", "MID": msg['MID'] }
+            # self.send(res)
+
+            # TODO:
+            # check if someone else becomes leader (AKA we get a message with leader != BROADCAST)
+                # if so, demote self to FOLLOWER (in case we were a CANDIDATE)
+                # adopt their log
+            # if timeout on this election, increment term, start again
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description='run a key-value store')
+    parser.add_argument('port', type=int, help="Port number to communicate")
+    parser.add_argument('id', type=str, help="ID of this replica")
+    parser.add_argument('others', metavar='others', type=str, nargs='+', help="IDs of other replicas")
+    args = parser.parse_args()
+    replica = Replica(args.port, args.id, args.others)
+    replica.run()
