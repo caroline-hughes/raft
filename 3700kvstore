@@ -8,7 +8,7 @@ HEARTBEAT_PERIOD = 140 # leader should send heartbeat every 140ms
 REPLICAS = 5
 # TIMEOUT_RANGE = [150, 300, 30]  # replicas will have a randomly assigned timeout from this fixed interval, staggered by 30
 
-class State(enum):
+class State(enum.Enum):
     FOLLOWER = 0
     CANDIDATE = 1
     LEADER = 2
@@ -19,7 +19,7 @@ class Replica:
     log = []        # list of lists, where each is an entry in the form [term, k, v]
     data = None     # dict of (k, v) pairs
     leader_id = None
-    timer_start = None
+    timer_start = 0
 
     my_voters = []              # our votees (if we are a candidate)
     voted_for = None            # candidate we voted for
@@ -43,7 +43,8 @@ class Replica:
 
         # assign self a timeout threshold in 150–300ms
         self.timeout_threshold = random.randrange(150, 300, 30)
-        self.timer_start = time.time()
+        self.timer_start = 0
+        print('timer start', self.timer_start)
 
     def send(self, message):
         print("Sent message: %s" % message, flush=True)
@@ -57,18 +58,28 @@ class Replica:
         # is their term >= ours?
         if json_msg['term'] < self.term:
             valid = False
+            print('false term')
 
         # is their log up to date with ours?
         src_last_i = json_msg['last_i']
-        src_last_term = json_msg['last_term'] # is a [term, k, v]
-        if src_last_term < self.log[len(self.log) - 1][0]:
+        src_last_term = json_msg['last_term'] # term of last thing in log
+
+        if self.term == 0 or self.term == 1:
+            last_term = 0;
+        else:
+            last_term = self.log[len(self.log) - 1][0]
+
+        if src_last_term < last_term:
             valid = False
+            print('false term')
         if src_last_i < len(self.log) - 1:
             valid = False
+            print('false index')
         
         # have we already voted?
         if self.voted_for is not None:
             valid = False
+            print('already voted')
 
         vote = 'true' if valid else 'false'
 
@@ -84,10 +95,16 @@ class Replica:
         self.send(votemsg)
 
     # if we arent the leader, check whether the leader has died
-    def check_leader_timeout(self):
-        if time.time() > (self.timer_start + self.timeout_threshold):
+    def check_timeout(self):
+        if time.time() > (self.timer_start + self.timeout_threshold) and self.state == State.FOLLOWER:
             # send RequestVote RPC
-            self.term += 1
+            if self.term == 0:
+                self.term += 1
+                last_term = 0
+            else:
+                self.term += 1
+                last_term = self.log[len(self.log) - 1][0]
+
             rv = { 
                 "src": self.id, 
                 "dst": BROADCAST, 
@@ -95,11 +112,16 @@ class Replica:
                 "type": "rv", 
                 "term": self.term, 
                 "last_i": len(self.log) - 1, # index of last thing in log 
-                "last_term": self.log[len(self.log) - 1][0] # term of last thing in log
+                "last_term": last_term # term of last thing in log
             }
             self.voted_for = self.id
             self.send(rv)
             self.state = State.CANDIDATE
+            # reset timer for the election
+            self.timeout_threshold = random.randrange(150, 300, 30)
+            self.timer_start = time.time()
+        if time.time() > (self.timer_start + self.timeout_threshold) and self.state == State.CANDIDATE:
+            print('election timed out')
 
     # if we are the leader, check whether we need to send a heartbeat message
     def check_heartbeat(self):
@@ -108,6 +130,7 @@ class Replica:
 
     # send AppendEntries RPCs to all replica followers
     def heartbeat(self):
+
         ae = { 
             "src": self.id, 
             "dst": BROADCAST, 
@@ -115,7 +138,7 @@ class Replica:
             "type": "ae", 
             "term": self.term,
             "prev_log_i": len(self.log) - 1,
-            "prev_log_term": self.log[len(self.log) - 1][0],
+            "prev_log_term": 0, # self.log[len(self.log) - 1][0],
             "entries": [], # empty for heartbeat
             "commit": len(self.log) - 1 # for heartbeat, commit = prev_log_i ?
             }
@@ -134,11 +157,28 @@ class Replica:
                 self.heartbeat()
         # else? do we need to do something if someone doesnt vote for us
 
+
+    # If the new leader is valid, become a followerer
+    def possible_new_leader(self, msg):
+        print(msg["src"], " declared themselves leader")
+        if msg['term'] >= self.term:
+            self.state = State.FOLLOWER
+            self.term = int(msg['term'])
+            self.leader_id = msg['src']
+            self.timeout_threshold = random.randrange(150, 300, 30)
+            self.timer_start = time.time()
+
+
+
+
+
+
+
     def run(self):
         while True:
             # Check for various timeouts, depending on state
             if self.state != State.LEADER:
-                self.check_leader_timeout()
+                self.check_timeout()
             if self.state == State.LEADER:
                 self.check_heartbeat()
 
@@ -158,6 +198,9 @@ class Replica:
             # check if we got votes, if we are a candidate
             if mtype == "vote" and self.state == State.CANDIDATE:
                 self.got_vote(msg)
+
+            if mtype == 'ae' and self.state == State.CANDIDATE:
+                self.possible_new_leader(msg)
 
             # (old work when we responded to everything with fail msg)
             # res = { "src": self.id, "dst": src, "leader": BROADCAST, "type": "fail", "MID": msg['MID'] }
