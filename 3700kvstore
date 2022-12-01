@@ -4,7 +4,7 @@ import argparse, socket, time, json, select, struct, sys, math, os, random
 import enum
 
 BROADCAST = "FFFF"
-HEARTBEAT_PERIOD = 140 # leader should send heartbeat every 140ms
+HEARTBEAT_PERIOD = .140 # leader should send heartbeat every 140ms
 REPLICAS = 5
 # TIMEOUT_RANGE = [150, 300, 30]  # replicas will have a randomly assigned timeout from this fixed interval, staggered by 30
 
@@ -42,8 +42,11 @@ class Replica:
         print("Sent hello message: %s" % hello, flush=True)
 
         # assign self a timeout threshold in 150–300ms
-        self.timeout_threshold = random.randrange(150, 300, 30)
-        self.timer_start = 0
+        self.timeout_threshold = random.randrange(150, 300, 10) / 1000 #threshold needs to be ms not s
+        print("threshold", self.timeout_threshold)
+
+        self.timer_start = time.time()
+        self.time_last_msg_sent = time.time()
         print('timer start', self.timer_start)
 
     def send(self, message):
@@ -96,6 +99,7 @@ class Replica:
 
     # if we arent the leader, check whether the leader has died
     def check_timeout(self):
+
         if time.time() > (self.timer_start + self.timeout_threshold) and self.state == State.FOLLOWER:
             # send RequestVote RPC
             if self.term == 0:
@@ -117,9 +121,11 @@ class Replica:
             self.voted_for = self.id
             self.send(rv)
             self.state = State.CANDIDATE
+            self.my_voters = []
             # reset timer for the election
             self.timeout_threshold = random.randrange(150, 300, 30)
             self.timer_start = time.time()
+            print('leader timed out')
         if time.time() > (self.timer_start + self.timeout_threshold) and self.state == State.CANDIDATE:
             print('election timed out')
 
@@ -152,8 +158,9 @@ class Replica:
         if vote == 'true' and (src not in self.my_voters):
             self.my_voters.append(src)
             # if we have a majority, we are now the leader
-            if len(self.my_voters) >= 3: 
+            if len(self.my_voters) >= 3:
                 self.state = State.LEADER
+                self.voted_for = None
                 self.heartbeat()
         # else? do we need to do something if someone doesnt vote for us
 
@@ -167,6 +174,7 @@ class Replica:
             self.leader_id = msg['src']
             self.timeout_threshold = random.randrange(150, 300, 30)
             self.timer_start = time.time()
+            self.voted_for = None
 
 
 
@@ -176,6 +184,7 @@ class Replica:
 
     def run(self):
         while True:
+
             # Check for various timeouts, depending on state
             if self.state != State.LEADER:
                 self.check_timeout()
@@ -185,7 +194,7 @@ class Replica:
             # Listen for messages
             data, addr = self.socket.recvfrom(65535) 
             msg = json.loads(data.decode('utf-8'))
-            # print("Received message '%s'" % (data.decode('utf-8'),), flush=True)
+            print("Received message '%s'" % (data.decode('utf-8'),), flush=True)
             mtype = msg['type']
             src = msg['src']
 
@@ -202,9 +211,10 @@ class Replica:
             if mtype == 'ae' and self.state == State.CANDIDATE:
                 self.possible_new_leader(msg)
 
+            '''if mtype == 'put':
             # (old work when we responded to everything with fail msg)
-            # res = { "src": self.id, "dst": src, "leader": BROADCAST, "type": "fail", "MID": msg['MID'] }
-            # self.send(res)
+                res = { "src": self.id, "dst": src, "leader": BROADCAST, "type": "fail", "MID": msg['MID'] }
+                self.send(res)'''
 
             # TODO:
             # check if someone else becomes leader (AKA we get a message with leader != BROADCAST)
