@@ -1,13 +1,11 @@
 #!/usr/bin/env python3
 
-import argparse, socket, time, json, select, struct, sys, math, os, random
+import argparse, socket, time, json, select, random
 import enum
-from webbrowser import get
 
 BROADCAST = "FFFF"
-HEARTBEAT_PERIOD = .140 # leader should send heartbeat every 140ms
+HEARTBEAT_PERIOD = .140  # leader should send heartbeat every 140ms
 REPLICAS = 5
-# TIMEOUT_RANGE = [150, 300, 30]  # replicas will have a randomly assigned timeout from this fixed interval, staggered by 30
 
 class State(enum.Enum):
     FOLLOWER = 0
@@ -15,28 +13,36 @@ class State(enum.Enum):
     LEADER = 2
 
 class Replica:
-    term = 0
-    state = State.FOLLOWER
-    log = []        # list of lists, where each is an entry in the form [term, k, v]
-    data = {}     # dict of (k, v) pairs
-    leader_id = BROADCAST
-    timer_start = 0
+    state = State.FOLLOWER  # current state of this replica
+    term = 0                # current term
+    leader_id = BROADCAST   # current leader of the cluster
 
-    my_voters = []              # our votees (if we are a candidate)
-    voted_for = None            # candidate we voted for
-    TIMEOUT = None    # our randomly assigned timeout threshold within [150, 300]
+    log = []      # list of triples: [term, k, v]
+    data = {}     # dict of committed (k, v) pairs
+    
+    # if follower, timer tracks last time we heard from leader
+    # if leader, timer tracks last time we sent an appendEntries
+    timer_start = 0  
+
+    # candidate fields:
+    my_voters = []  # our votees
+
+    # follower fields:
+    voted = False     # flag for if weve voted in the election yet
+    TIMEOUT = None    # our timeout threshold in ms
 
     # leader fields:
-    time_last_msg_sent = None  # time since our last message (heartbeat or get/put)
-    nextIndexes = [0,0,0,0,0]
-    commitIndex = -1
-    puts_queue = []
-    successes = 0
-    awaiting_majority = False
-    # MIDs = {}
-    curr_k_v = [None, None]
-    curr_mid = None
-    curr_client = None
+    curr_client = None         # the current client being serviced by the put()
+    curr_mid = None            # the current message id being serviced by the put()
+    curr_k_v = [None, None]    # the current (k,v) pair to be put()
+
+    awaiting_majority = False  # flag for whether this put() is complete
+    successes = 0              # number of followers who agree to the current put
+    puts_queue = []            # the list of the next client put()s
+
+    commitIndex = -1           # the index of the committed entry in log
+    nextIndexes = [0,0,0,0,0]  # TODO 
+    
 
     def __init__(self, port, id, others):
         self.port = port
@@ -49,150 +55,139 @@ class Replica:
         print("Replica %s starting up" % self.id, flush=True)
         hello = { "src": self.id, "dst": BROADCAST, "leader": BROADCAST, "type": "hello" }
         self.send(hello)
-        #print("Sent hello message: %s" % hello, flush=True)
 
-        # assign self a timeout threshold in 150–300ms
-        self.TIMEOUT = random.randrange(150, 300) / 1000 #threshold needs to be ms not s
-        print('\nfor ' + str(self.id) + ' timeout is ' + str(self.TIMEOUT))
-
+        # assign timeout within 150–300ms
+        self.TIMEOUT = random.randrange(150, 300) / 1000 
+        # print('\nfor ' + str(self.id) + ' timeout is ' + str(self.TIMEOUT))
         self.timer_start = time.time() 
-        self.time_last_msg_sent = time.time()
-        print('timer start', self.timer_start)
 
     def send(self, message):
         print("Sent message: %s" % message, flush=True)
         self.socket.sendto(json.dumps(message).encode('utf-8'), ('localhost', self.port))
 
-    # recieved a RequestVote RPC
+    # received a RequestVote RPC
     def got_request_vote(self, json_msg):
         src = json_msg['src']
         valid = True
 
-        # is their term >= ours?
+        # 1. Reply false if term < currentTerm (§5.1)
         if json_msg['term'] < self.term:
             valid = False
-            print('false term')
-
-        # is their log up to date with ours?
-        src_last_i = json_msg['last_i']
-        src_last_term = json_msg['last_term'] # term of last thing in log
-
-        if self.term == 0 or self.term == 1:
-            last_term = 0
-        else:
-            last_term = self.log[len(self.log) - 1][0]
-
-        if src_last_term < last_term:
-            valid = False
-            print('false term')
-        if src_last_i < len(self.log) - 1:
-            valid = False
-            print('false index')
         
-        # have we already voted?
-        if self.voted_for is not None:
+        # 2. Cannot vote twice (§5.2)
+        if self.voted:
             valid = False
-            print('already voted')
 
-        vote = 'true' if valid else 'false'
+        # 3. If candidate’s log is at least as up-to-date as receiver’s log, grant vote (§5.4)
+        # ie. it is guaranteed that the election winner will have most up to date logs
+        src_last_i = json_msg['last_i'] 
+        src_last_term = json_msg['last_term']
+        
+        last_i = len(self.log) - 1
+        last_term = -1 if self.log == [] else self.log[last_i][0]
+
+        if src_last_i < last_i or src_last_term < last_term:
+            valid = False
 
         votemsg = { 
             "src": self.id, 
             "dst": src,
             "leader": BROADCAST, 
             "type": "vote", 
-            "vote": vote,
+            "vote": 'true' if valid else 'false',
             "cand_id": src, 
         }
-        self.voted_for = src
+
         self.send(votemsg)
+        self.voted = valid
+    
 
-    def last_log_term(self):
-        return self.log[len(self.log) - 1][0]
-
-    # if we arent the leader, check whether the leader has died
+    # if not the leader, monitor leader timeout
     def check_timeout(self):
         if time.time() > (self.timer_start + self.TIMEOUT) and self.state == State.FOLLOWER:
-            if self.leader_id == BROADCAST: print('\n\nELECTING LEADER')
+            # for debugging:
+            if self.leader_id == BROADCAST: print('\n\n ELECTING LEADER')
             else: print('\n\n LEADER DIED')
+            # print(str(self.id) + ' is sending RequestVote')
 
-            print(str(self.id) + ' sending requestvote')
-            # send RequestVote RPC
+            # become a candidate, increment our term, send RequestVote
+            self.leader_id = BROADCAST
+            self.state = State.CANDIDATE
             self.term += 1
-            last_term = 0 if self.log == [] else self.last_log_term()
+
+            last_i = len(self.log) - 1
+            last_term = -1 if self.log == [] else self.log[last_i][0]
             rv = { 
                 "src": self.id, 
                 "dst": BROADCAST, 
                 "leader": BROADCAST,
                 "type": "rv", 
                 "term": self.term, 
-                "last_i": len(self.log) - 1, # index of last thing in log 
-                "last_term": last_term # term of last thing in log
+                "last_i": last_i,         # index of last log entry
+                "last_term": last_term    # term of that entry
             }
-            self.voted_for = self.id
+            self.voted = True
             self.send(rv)
-            self.leader_id = BROADCAST
-            self.state = State.CANDIDATE
             self.my_voters = [self.id]
-            # reset timer for the election
-            # self.TIMEOUT = random.randrange(150, 300)
-            print('starting election timer')
             self.timer_start = time.time()
             
         if time.time() > (self.timer_start + self.TIMEOUT) and self.state == State.CANDIDATE:
             print('election timed out')
 
-    # if we are the leader, check whether we need to send a heartbeat message
+    # if leader, monitor heartbeat
     def check_heartbeat(self):
-        if time.time() > (self.time_last_msg_sent + HEARTBEAT_PERIOD):
-            # print('leader ' + str(self.id) + ' sending heartbeat')
+        if time.time() > (self.timer_start + HEARTBEAT_PERIOD):
+            print('\nHEARTBEAT')
             self.send_append_entries(heartbeat = True)
 
-    def getterm(self, entry):
-        if entry:
-            return entry[0] # term lives at index 0
-        else:
-            return -1
+    # def getterm(self, entry):
+    #     if entry:
+    #         return entry[0] # term lives at index 0
+    #     else:
+    #         return -1
 
-    # send AppendEntries RPCs to all replica followers
+    # inform followers of new log entries via AppendEntries RPC
     def send_append_entries(self, heartbeat = False):
-        prev_log_i = -1 if len(self.log) < 2  else len(self.log) - 2   # index of entry imm preceding new ones .. 
-        print('\n\nin send_append_entries, prev_log_i =', prev_log_i)
-        prev_log_term = -1 if len(self.log) < 2 else self.getterm(self.log[prev_log_i]) # term of prev_log_i
-        entries = [] if self.log == [] else self.log[prev_log_i+1:]  # everything after prev_log_i in the log
+        # "index of entry immediately preceding new ones". right now we always only add 1 at a time, so this will always be len(log) - 2.
+        prev_log_i = len(self.log) - 2                                              # SECOND to last index in log
 
-        if entries:
-            self.currentPutKey = entries[0][1] # term, key, value
-        ae = { 
+        prev_log_term = -1 if len(self.log) <= 1 else self.log[prev_log_i][0]       # term of that entry
+
+        entries = [] if self.log == [] else self.log[prev_log_i+1:]                 # everything after prev_log_i in the log
+
+        ae = {
             "src": self.id, 
             "dst": BROADCAST, 
             "leader": self.id,
             "type": "ae",
             "term": self.term,
-            "prev_log_i": prev_log_i, # if log = [], prev_log_i = -1
-            "prev_log_term": prev_log_term, # if log = [], prev_log_term = -1
+            "prev_log_i": prev_log_i,
+            "prev_log_term": prev_log_term,
             "entries": [] if heartbeat else entries, 
             "commit": self.commitIndex
             }
-        self.time_last_msg_sent = time.time()
+        self.timer_start = time.time()
         self.send(ae)
 
-    # if we are a candidate, parse the vote someone casted for us
+    # if candidate, parse the vote we received
     def got_vote(self, msg):
         if self.state == State.LEADER:
-            return # already leader
-        vote = msg['vote']
-        src = msg['src']
-        if vote == 'true' and (src not in self.my_voters):
-            self.my_voters.append(src)
+            return # already leader, ignore
+        voter = msg['src']
+        if msg['vote'] == 'true' and (voter not in self.my_voters):
+            self.my_voters.append(voter)
             # if we have a majority, we are now the leader
             if len(self.my_voters) >= 3:
-                print('\n\n LEADER IS', str(self.id))
+                print('\n\n LEADER IS', self.id)
                 self.state = State.LEADER
                 self.leader_id = self.id
-                self.voted_for = None
+                self.voted = False
+                self.my_voters = []
+
+                # start heartbeat as new leader
                 self.send_append_entries(heartbeat = True)
-        # else? do we need to do something if someone doesnt vote for us
+
+        # else? do we need to do something if someone doesn't vote for us?
 
 
     # logic for getting an appendEntries RPC
@@ -200,55 +195,54 @@ class Replica:
         # reconcile your logs with theirs
         # accept or reject
     def got_append_entries(self, msg):
-        # if there is a new leader
         self.timer_start = time.time()
         leader = msg["src"]
-        entries = msg['entries']
+        entries = msg["entries"]
+
+        # if this is a new leader
         if self.leader_id == BROADCAST:
             self.state = State.FOLLOWER
             self.leader_id = leader
-            self.voted_for = None
-            self.term = msg["term"]
+            self.voted = False
             self.my_voters = [] # in case you had also been running for election
         
-        if entries == []:
-            print('\nHEARTBEAT')
-            return
+        # if not just a heartbeat
+        if entries != []:
+            print('\nGOT AE')
+            valid = True
 
-        print('\nGOT AE')
-        valid = True
-        # 1. Reply false if term < currentTerm (§5.1)
-        if int(msg["term"]) < self.term:
-            valid = False
+            # 1. Reply false if term < currentTerm (§5.1)
+            if int(msg["term"]) < self.term:
+                valid = False
 
-        self.log.append(entries)
-        # prev_log_i = int(msg["prev_log_i"]) # -1 if leaders log len < 2
-        # prev_log_term = int(msg["prev_log_term"]) # -1 if leaders log len < 2
-        # if prev_log_i != -1:
-        #     # 2. Reply false if log doesn’t contain an entry at prevLogIndex whose term matches prevLogTerm (§5.3)
-        #     if self.log[prev_log_i] is None or (self.log[prev_log_i][0] != prev_log_term):
-        #         valid = False
-        # key = entries[0][1]
-        ae_res = { 
-            "src": self.id, 
-            "dst": leader, 
-            "leader": leader,
-            "type": "ae_res",
-            "term": self.term,
-            "index": msg["prev_log_i"],
-            "success": "true" if valid else "false"
-            }
-        self.send(ae_res)
+            self.log.append(entries)
+            # prev_log_i = int(msg["prev_log_i"]) # -1 if leaders log len < 2
+            # prev_log_term = int(msg["prev_log_term"]) # -1 if leaders log len < 2
+            # if prev_log_i != -1:
+            #     # 2. Reply false if log doesn’t contain an entry at prevLogIndex whose term matches prevLogTerm (§5.3)
+            #     if self.log[prev_log_i] is None or (self.log[prev_log_i][0] != prev_log_term):
+            #         valid = False
+            # key = entries[0][1]
+            ae_res = { 
+                "src": self.id, 
+                "dst": leader, 
+                "leader": leader,
+                "type": "ae_res",
+                "term": self.term,
+                "index": msg["prev_log_i"],
+                "success": "true" if valid else "false"
+                }
+            self.send(ae_res)
 
-        # TODO: finish log replication
-        # 3. If an existing entry conflicts with a new one (same index
-        # but different terms), delete the existing entry and all that follow it (§5.3)
-        # for i, entry in enumerate(self.log[prev_log_i + 1:]): # entries is the leaders' log[prev_log_i+1:]
-        #     if entry[0] != entries[i][0] or entry[1] != entries[i][1] or entry[2] != entries[i][2]:
-        #         newEntry = entries[i]
-        #         entry = newEntry
-        #         break
-        # 4. Append any new entries not already in the log
+            # TODO: finish log replication
+            # 3. If an existing entry conflicts with a new one (same index
+            # but different terms), delete the existing entry and all that follow it (§5.3)
+            # for i, entry in enumerate(self.log[prev_log_i + 1:]): # entries is the leaders' log[prev_log_i+1:]
+            #     if entry[0] != entries[i][0] or entry[1] != entries[i][1] or entry[2] != entries[i][2]:
+            #         newEntry = entries[i]
+            #         entry = newEntry
+            #         break
+            # 4. Append any new entries not already in the log
 
 
 
@@ -286,12 +280,12 @@ class Replica:
                     if mtype == 'get':
                         self.handle_get(msg)
 
-                    if mtype == 'ae_res':
+                    # handle a follower response to AppendEntries
+                    if mtype == 'ae_res' and self.state == State.LEADER:
                         self.got_ae_res(msg)
 
             for writer in outgoing:
                 if writer is self.socket:
-                    # send logic
                     # Check for various timeouts, depending on state
                     if self.state != State.LEADER:
                         self.check_timeout()
@@ -305,13 +299,11 @@ class Replica:
         if success and index == self.commitIndex:
             self.successes += 1
             if self.successes >= 2:
-                print('MAJORITY SUCCESSES, committing index', self.commitIndex)
+                print('\n\nGOT MAJORITY, committing log at index', self.commitIndex)
 
-                # grab the most recent entry, that is the one to commit
+                # grab the most recent entry, commit to data dict
                 entry = self.log[len(self.log) - 1]
-                # commit it by adding it to our data dict
                 self.data[entry[1]] = entry[2] 
-                print('now data = ', self.data)
 
                 # tell the client we've committed their put()
                 put_ok = {
@@ -333,7 +325,7 @@ class Replica:
                     self.puts_logic(next_put_msg)         # kick off next put() 
 
         else:
-            # otherwise decrement index and try again
+            # TODO: otherwise decrement index and try again
             return
 
     def handle_put(self, msg):
@@ -360,31 +352,27 @@ class Replica:
 
     # leader logic for informing replicas about put() from client
     def puts_logic(self, msg):
-        # duplicate put()?
-        if self.curr_k_v == [msg["key"], msg["value"]]:
-            return
+        # if non duplicate put()
+        if [msg["key"], msg["value"]] != self.curr_k_v:
 
-        # 1. keep track of MID and client for our response
-        self.curr_mid = msg['MID']
-        self.curr_client = msg['src']
+            # 1. keep track of MID and client for our response
+            self.curr_mid = msg['MID']
+            self.curr_client = msg['src']
 
-        # 2. form the new log entry
-        entry = [self.term, msg["key"], msg["value"]]
-        self.log.append(entry)
+            # 2. form the new log entry
+            entry = [self.term, msg["key"], msg["value"]]
+            self.log.append(entry)
 
-        # 3. inform replicas, wait for majority successes
-        self.send_append_entries()
-        self.awaiting_majority = True
+            # 3. inform replicas, wait for majority successes
+            self.send_append_entries()
+            self.awaiting_majority = True
         
 
     def handle_get(self, msg):
         print('\n\n\n\n GET()')
-        # {"src": "<ID>", "dst": "<ID>", "leader": "<ID>", "type": "get", "MID": "<a unique string>", key": "<some key>"}
+        # if we have committed the key to our dict, return the value
         if msg["key"] in self.data.keys():
-            val = self.data[msg["key"]]  # THE PROBLEM
-            print('\n data is:', self.data)
-            print('\n the val is:', val)
-
+            val = self.data[msg["key"]]
             get_ok = {
                 "src": self.id, 
                 "dst": msg["src"], 
