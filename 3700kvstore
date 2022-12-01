@@ -18,15 +18,20 @@ class Replica:
     state = State.FOLLOWER
     log = []        # list of lists, where each is an entry in the form [term, k, v]
     data = None     # dict of (k, v) pairs
-    leader_id = None
+    leader_id = BROADCAST
     timer_start = 0
 
     my_voters = []              # our votees (if we are a candidate)
     voted_for = None            # candidate we voted for
-    timeout_threshold = None    # our randomly assigned timeout threshold within [150, 300]
+    TIMEOUT = None    # our randomly assigned timeout threshold within [150, 300]
 
-    # leader field:
+    # leader fields:
     time_last_msg_sent = None  # time since our last message (heartbeat or get/put)
+    nextIndexes = [0,0,0,0,0]
+    commitIndex = -1
+    puts_queue = []
+    successes = 0
+    awaiting_majority = False
 
     def __init__(self, port, id, others):
         self.port = port
@@ -39,13 +44,13 @@ class Replica:
         print("Replica %s starting up" % self.id, flush=True)
         hello = { "src": self.id, "dst": BROADCAST, "leader": BROADCAST, "type": "hello" }
         self.send(hello)
-        print("Sent hello message: %s" % hello, flush=True)
+        #print("Sent hello message: %s" % hello, flush=True)
 
         # assign self a timeout threshold in 150–300ms
-        self.timeout_threshold = random.randrange(150, 300, 10) / 1000 #threshold needs to be ms not s
-        print("threshold", self.timeout_threshold)
+        self.TIMEOUT = random.randrange(150, 300) / 1000 #threshold needs to be ms not s
+        print('\nfor ' + str(self.id) + ' timeout is ' + str(self.TIMEOUT))
 
-        self.timer_start = time.time()
+        self.timer_start = time.time() 
         self.time_last_msg_sent = time.time()
         print('timer start', self.timer_start)
 
@@ -68,7 +73,7 @@ class Replica:
         src_last_term = json_msg['last_term'] # term of last thing in log
 
         if self.term == 0 or self.term == 1:
-            last_term = 0;
+            last_term = 0
         else:
             last_term = self.log[len(self.log) - 1][0]
 
@@ -97,22 +102,21 @@ class Replica:
         self.voted_for = src
         self.send(votemsg)
 
+    def last_log_term(self):
+        return self.log[len(self.log) - 1][0]
+
     # if we arent the leader, check whether the leader has died
     def check_timeout(self):
-
-        if time.time() > (self.timer_start + self.timeout_threshold) and self.state == State.FOLLOWER:
+        if time.time() > (self.timer_start + self.TIMEOUT) and self.state == State.FOLLOWER:
+            print('\n\n LEADER DIED')
+            print(str(self.id) + ' timeout. sending requestvote')
             # send RequestVote RPC
-            if self.term == 0:
-                self.term += 1
-                last_term = 0
-            else:
-                self.term += 1
-                last_term = self.log[len(self.log) - 1][0]
-
+            self.term += 1
+            last_term = 0 if self.log == [] else self.last_log_term()
             rv = { 
                 "src": self.id, 
                 "dst": BROADCAST, 
-                "leader": BROADCAST, 
+                "leader": BROADCAST,
                 "type": "rv", 
                 "term": self.term, 
                 "last_i": len(self.log) - 1, # index of last thing in log 
@@ -120,108 +124,218 @@ class Replica:
             }
             self.voted_for = self.id
             self.send(rv)
+            self.leader_id = BROADCAST
             self.state = State.CANDIDATE
-            self.my_voters = []
+            self.my_voters = [self.id]
             # reset timer for the election
-            self.timeout_threshold = random.randrange(150, 300, 30)
+            # self.TIMEOUT = random.randrange(150, 300)
+            print('starting election timer')
             self.timer_start = time.time()
-            print('leader timed out')
-        if time.time() > (self.timer_start + self.timeout_threshold) and self.state == State.CANDIDATE:
+            
+        if time.time() > (self.timer_start + self.TIMEOUT) and self.state == State.CANDIDATE:
             print('election timed out')
 
     # if we are the leader, check whether we need to send a heartbeat message
     def check_heartbeat(self):
-        if time.time() > self.time_last_msg_sent + HEARTBEAT_PERIOD:
-            self.heartbeat()
+        if time.time() > (self.time_last_msg_sent + HEARTBEAT_PERIOD):
+            print('leader ' + str(self.id) + ' sending heartbeat')
+            self.send_append_entries(heartbeat = True)
+
+    def getterm(self, entry):
+        if entry:
+            return entry[0] # term lives at index 0
+        else:
+            return -1
 
     # send AppendEntries RPCs to all replica followers
-    def heartbeat(self):
-
+    def send_append_entries(self, index_of_entry = -1, heartbeat = False):
+        prev_log_i = -1 if len(self.log) < 2  else index_of_entry - 1   # index of entry imm preceding new ones .. 
+        prev_log_term = -1 if len(self.log) < 2 else self.getterm(self.log[prev_log_i]) # term of prev_log_i
+        entries = [] if self.log == [] else self.log[prev_log_i+1:]  # everything after prev_log_i in the log
         ae = { 
             "src": self.id, 
             "dst": BROADCAST, 
-            "leader": self.id, 
-            "type": "ae", 
+            "leader": self.id,
+            "type": "ae",
             "term": self.term,
-            "prev_log_i": len(self.log) - 1,
-            "prev_log_term": 0, # self.log[len(self.log) - 1][0],
-            "entries": [], # empty for heartbeat
-            "commit": len(self.log) - 1 # for heartbeat, commit = prev_log_i ?
+            "prev_log_i": prev_log_i, # if log = [], prev_log_i = -1
+            "prev_log_term": prev_log_term, # if log = [], prev_log_term = -1
+            "entries": [] if heartbeat else entries, 
+            "commit": self.commitIndex
             }
+        self.time_last_msg_sent = time.time()
         self.send(ae)
-        self.time_of_last_msg = time.time()
 
     # if we are a candidate, parse the vote someone casted for us
     def got_vote(self, msg):
+        if self.state == State.LEADER:
+            return # already leader
         vote = msg['vote']
         src = msg['src']
         if vote == 'true' and (src not in self.my_voters):
             self.my_voters.append(src)
             # if we have a majority, we are now the leader
             if len(self.my_voters) >= 3:
+                print('\n\n LEADER IS', str(self.id))
                 self.state = State.LEADER
+                self.leader_id = self.id
                 self.voted_for = None
-                self.heartbeat()
+                self.send_append_entries(heartbeat = True)
         # else? do we need to do something if someone doesnt vote for us
 
 
-    # If the new leader is valid, become a followerer
-    def possible_new_leader(self, msg):
-        print(msg["src"], " declared themselves leader")
-        if msg['term'] >= self.term:
+    # logic for getting an appendEntries RPC
+        # if new leader, update fields
+        # reconcile your logs with theirs
+        # accept or reject
+    def got_append_entries(self, msg):
+        leader = msg["src"]
+        entries = msg['entries']
+        print('entries were', entries)
+        # was a heartbeat
+        if entries == []:
+            print('\nGOT HEARTBEAT')
+            return
+        
+        print('\nGOT AE')
+        # if there is a new leader
+        if self.leader_id == BROADCAST:
+            print(leader, " declared themselves leader")
             self.state = State.FOLLOWER
-            self.term = int(msg['term'])
-            self.leader_id = msg['src']
-            self.timeout_threshold = random.randrange(150, 300, 30)
-            self.timer_start = time.time()
+            self.leader_id = leader
             self.voted_for = None
+            self.my_voters = [] # in case you had also been running for election
+        
+        self.timer_start = time.time()
 
+        valid = True
+        # 1. Reply false if term < currentTerm (§5.1)
+        if int(msg["term"]) < self.term:
+            valid = False
 
+        self.log.append(entries)
+        # prev_log_i = int(msg["prev_log_i"]) # -1 if leaders log len < 2
+        # prev_log_term = int(msg["prev_log_term"]) # -1 if leaders log len < 2
+        # if prev_log_i != -1:
+        #     # 2. Reply false if log doesn’t contain an entry at prevLogIndex whose term matches prevLogTerm (§5.3)
+        #     if self.log[prev_log_i] is None or (self.log[prev_log_i][0] != prev_log_term):
+        #         valid = False
+        print('responding to leader...')
+        # send responses
+        ae_res = { 
+            "src": self.id, 
+            "dst": leader, 
+            "leader": leader,
+            "type": "ae_res",
+            "term": self.term,
+            "index": msg["prev_log_i"],
+            "success": "true" if valid else "false"
+            }
+        self.send(ae_res)
 
-
+        # TODO: finish log replication
+        # 3. If an existing entry conflicts with a new one (same index
+        # but different terms), delete the existing entry and all that follow it (§5.3)
+        # for i, entry in enumerate(self.log[prev_log_i + 1:]): # entries is the leaders' log[prev_log_i+1:]
+        #     if entry[0] != entries[i][0] or entry[1] != entries[i][1] or entry[2] != entries[i][2]:
+        #         newEntry = entries[i]
+        #         entry = newEntry
+        #         break
+        # 4. Append any new entries not already in the log
 
 
 
     def run(self):
         while True:
+            incoming, outgoing, exceptional = select.select([self.socket], [self.socket], [self.socket])
+            for reader in incoming:
+                if reader is self.socket:
+                    # recv
+                    data, addr = self.socket.recvfrom(65535)
+                    msg = json.loads(data.decode('utf-8'))
+                    print("Received message '%s'" % (data.decode('utf-8'),), flush=True)
+                    mtype = msg['type']
+                    src = msg['src']
 
-            # Check for various timeouts, depending on state
-            if self.state != State.LEADER:
-                self.check_timeout()
-            if self.state == State.LEADER:
-                self.check_heartbeat()
+                    # Does this logic also go within here? it involves send()s ....
 
-            # Listen for messages
-            data, addr = self.socket.recvfrom(65535) 
-            msg = json.loads(data.decode('utf-8'))
-            print("Received message '%s'" % (data.decode('utf-8'),), flush=True)
-            mtype = msg['type']
-            src = msg['src']
+                    # handle a requestVote RPC
+                    if mtype == "rv":
+                        self.got_request_vote(msg)
 
-            # Perform logic based on type of message
+                    # handle a vote
+                    if mtype == "vote" and self.state == State.CANDIDATE:
+                        self.got_vote(msg)
 
-            # check if someone elected themself as a candidate
-            if mtype == "rv":
-                self.got_request_vote(msg)
+                    # handle an appendEntries RPC
+                    if mtype == 'ae':
+                        self.got_append_entries(msg)
 
-            # check if we got votes, if we are a candidate
-            if mtype == "vote" and self.state == State.CANDIDATE:
-                self.got_vote(msg)
+                    # handle client put/get
+                    if mtype == 'put':
+                        self.handle_put(msg)
 
-            if mtype == 'ae' and self.state == State.CANDIDATE:
-                self.possible_new_leader(msg)
+                    # handle client put/get
+                    if mtype == 'get':
+                        self.handle_get(msg)
 
-            '''if mtype == 'put':
-            # (old work when we responded to everything with fail msg)
-                res = { "src": self.id, "dst": src, "leader": BROADCAST, "type": "fail", "MID": msg['MID'] }
-                self.send(res)'''
+                    if mtype == 'ae_res':
+                        self.got_ae_res(msg)
 
-            # TODO:
-            # check if someone else becomes leader (AKA we get a message with leader != BROADCAST)
-                # if so, demote self to FOLLOWER (in case we were a CANDIDATE)
-                # adopt their log
-            # if timeout on this election, increment term, start again
+            for writer in outgoing:
+                if writer is self.socket:
+                    # send logic
+                    # Check for various timeouts, depending on state
+                    if self.state != State.LEADER:
+                        self.check_timeout()
+                    if self.state == State.LEADER:
+                        self.check_heartbeat()
 
+    def got_ae_res(self, msg):
+        # if success
+        success = msg["success"]
+        if success:
+            self.successes += 1
+            if self.successes >= 3:
+                print('GOT ALL SUCCESSES, committing index', self.commitIndex)
+                self.commitIndex += 1
+                self.awaiting_majority = False
+                if self.puts_queue != []:
+                    self.send(self.puts_queue[0]) # send first in queue
+                    self.successes = 0 # reset successes counter
+                    self.puts_queue.pop(0) # remove from queue
+                    self.awaiting_majority = True
+        else:
+            # otherwise decrement index and try again
+            return
+
+    def handle_put(self, msg):
+        # if client doesn't know who leader is
+        if msg['leader'] == BROADCAST or msg['leader'] != self.leader_id:
+            print('\n REDIRECT. TELLING CLIENT ABOUT LEADER')
+            redirect = {
+                "src": self.id, 
+                "dst": msg["src"],
+                "leader": self.leader_id,
+                "type": "redirect", 
+                "MID": msg['MID']
+                }
+            self.send(redirect)
+            return
+        # otherwise, if we are the leader, append to log and send appendEntries to followers
+        if msg['leader'] == self.leader_id and self.state == State.LEADER:
+            print('\n LEADER GOT PUT')
+            entry = [self.term, msg["key"], msg["value"]]
+            self.log.append(entry)
+            print('\n LOG IS NOW : ', self.log)
+            if not self.awaiting_majority:
+                self.send_append_entries(len(self.log) - 1)
+                self.awaiting_majority = True
+            else:
+                self.puts_queue.append(len(self.log) - 1)
+
+    def handle_get(self, msg):
+        return
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='run a key-value store')
