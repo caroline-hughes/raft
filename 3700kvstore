@@ -192,6 +192,7 @@ class Replica:
         # accept or reject
     def got_append_entries(self, msg):
         # if there is a new leader
+        self.timer_start = time.time()
         leader = msg["src"]
         entries = msg['entries']
         if self.leader_id == BROADCAST:
@@ -206,8 +207,6 @@ class Replica:
             return
 
         print('\nGOT AE')
-        self.timer_start = time.time()
-
         valid = True
         # 1. Reply false if term < currentTerm (§5.1)
         if int(msg["term"]) < self.term:
