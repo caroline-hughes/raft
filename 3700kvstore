@@ -29,6 +29,7 @@ class Replica:
     time_last_msg_sent = None  # time since our last message (heartbeat or get/put)
     nextIndexes = [0,0,0,0,0]
     commitIndex = -1
+    currentPutMsg = None
     puts_queue = []
     successes = 0
     awaiting_majority = False
@@ -200,6 +201,7 @@ class Replica:
             self.state = State.FOLLOWER
             self.leader_id = leader
             self.voted_for = None
+            self.term = msg["term"]
             self.my_voters = [] # in case you had also been running for election
         
         if entries == []:
@@ -230,6 +232,8 @@ class Replica:
             "index": msg["prev_log_i"],
             "success": "true" if valid else "false"
             }
+        # print('\nREPLICAS CURRENT LOG')
+        # print(self.log)
         self.send(ae_res)
 
         # TODO: finish log replication
@@ -293,20 +297,34 @@ class Replica:
     def got_ae_res(self, msg):
         # if success
         success = msg["success"]
-        if success:
+        index = msg["index"]
+        if success and index == self.commitIndex:
             self.successes += 1
             if self.successes >= 3:
                 print('GOT ALL SUCCESSES, committing index', self.commitIndex)
                 self.commitIndex += 1
+                self.sendOK()
                 self.awaiting_majority = False
+                self.successes = 0  # reset successes counter
                 if self.puts_queue != []:
                     self.send_append_entries(index_of_entry = self.puts_queue[0]) # send first in queue
-                    self.successes = 0 # reset successes counter
                     self.puts_queue.pop(0) # remove from queue
                     self.awaiting_majority = True
         else:
             # otherwise decrement index and try again
             return
+
+    def sendOK(self):
+        ok = {
+            "src": self.id,
+            "dst": self.currentPutMsg['src'],
+            "leader": self.leader_id,
+            "type": "ok",
+            "MID": self.currentPutMsg['MID'],
+            "index": msg["prev_log_i"],
+            "success": "true" if valid else "false"
+        }
+
 
     def handle_put(self, msg):
         # if client doesn't know who leader is
@@ -325,6 +343,7 @@ class Replica:
         if msg['leader'] == self.leader_id and self.state == State.LEADER:
             print('\n LEADER GOT PUT')
             entry = [self.term, msg["key"], msg["value"]]
+            self.currentPutMsg = msg
             self.log.append(entry)
             print('\n LOG IS NOW : ', self.log)
             if not self.awaiting_majority:
