@@ -108,8 +108,10 @@ class Replica:
     # if we arent the leader, check whether the leader has died
     def check_timeout(self):
         if time.time() > (self.timer_start + self.TIMEOUT) and self.state == State.FOLLOWER:
-            print('\n\n LEADER DIED')
-            print(str(self.id) + ' timeout. sending requestvote')
+            if self.leader_id == BROADCAST: print('\n\nELECTING LEADER')
+            else: print('\n\n LEADER DIED')
+
+            print(str(self.id) + ' sending requestvote')
             # send RequestVote RPC
             self.term += 1
             last_term = 0 if self.log == [] else self.last_log_term()
@@ -189,16 +191,9 @@ class Replica:
         # reconcile your logs with theirs
         # accept or reject
     def got_append_entries(self, msg):
+        # if there is a new leader
         leader = msg["src"]
         entries = msg['entries']
-        print('entries were', entries)
-        # was a heartbeat
-        if entries == []:
-            print('\nGOT HEARTBEAT')
-            return
-        
-        print('\nGOT AE')
-        # if there is a new leader
         if self.leader_id == BROADCAST:
             print(leader, " declared themselves leader")
             self.state = State.FOLLOWER
@@ -206,6 +201,11 @@ class Replica:
             self.voted_for = None
             self.my_voters = [] # in case you had also been running for election
         
+        if entries == []:
+            print('\nGOT HEARTBEAT')
+            return
+
+        print('\nGOT AE')
         self.timer_start = time.time()
 
         valid = True
@@ -301,7 +301,7 @@ class Replica:
                 self.commitIndex += 1
                 self.awaiting_majority = False
                 if self.puts_queue != []:
-                    self.send(self.puts_queue[0]) # send first in queue
+                    self.send_append_entries(index_of_entry = self.puts_queue[0]) # send first in queue
                     self.successes = 0 # reset successes counter
                     self.puts_queue.pop(0) # remove from queue
                     self.awaiting_majority = True
@@ -329,7 +329,7 @@ class Replica:
             self.log.append(entry)
             print('\n LOG IS NOW : ', self.log)
             if not self.awaiting_majority:
-                self.send_append_entries(len(self.log) - 1)
+                self.send_append_entries(index_of_entry = len(self.log) - 1)
                 self.awaiting_majority = True
             else:
                 self.puts_queue.append(len(self.log) - 1)
