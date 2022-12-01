@@ -33,8 +33,10 @@ class Replica:
     puts_queue = []
     successes = 0
     awaiting_majority = False
-    MIDs = {}
-    currentPutKey = None
+    # MIDs = {}
+    curr_k_v = [None, None]
+    curr_mid = None
+    curr_client = None
 
     def __init__(self, port, id, others):
         self.port = port
@@ -153,8 +155,9 @@ class Replica:
             return -1
 
     # send AppendEntries RPCs to all replica followers
-    def send_append_entries(self, index_of_entry = -1, heartbeat = False):
-        prev_log_i = -1 if len(self.log) < 2  else index_of_entry - 1   # index of entry imm preceding new ones .. 
+    def send_append_entries(self, heartbeat = False):
+        prev_log_i = -1 if len(self.log) < 2  else len(self.log) - 2   # index of entry imm preceding new ones .. 
+        print('\n\nin send_append_entries, prev_log_i =', prev_log_i)
         prev_log_term = -1 if len(self.log) < 2 else self.getterm(self.log[prev_log_i]) # term of prev_log_i
         entries = [] if self.log == [] else self.log[prev_log_i+1:]  # everything after prev_log_i in the log
 
@@ -225,14 +228,13 @@ class Replica:
         #     # 2. Reply false if log doesn’t contain an entry at prevLogIndex whose term matches prevLogTerm (§5.3)
         #     if self.log[prev_log_i] is None or (self.log[prev_log_i][0] != prev_log_term):
         #         valid = False
-        key = entries[0][1]
+        # key = entries[0][1]
         ae_res = { 
             "src": self.id, 
             "dst": leader, 
             "leader": leader,
             "type": "ae_res",
             "term": self.term,
-            "key": key,
             "index": msg["prev_log_i"],
             "success": "true" if valid else "false"
             }
@@ -296,48 +298,46 @@ class Replica:
                     if self.state == State.LEADER:
                         self.check_heartbeat()
 
+    # handle success or failure response from follower after an appendEntries RPC
     def got_ae_res(self, msg):
-        # if success
         success = msg["success"]
         index = msg['index']
         if success and index == self.commitIndex:
             self.successes += 1
-            if self.successes >= 3:
-                print('GOT ALL SUCCESSES, committing index', self.commitIndex)
+            if self.successes >= 2:
+                print('MAJORITY SUCCESSES, committing index', self.commitIndex)
 
-
+                # grab the most recent entry, that is the one to commit
                 entry = self.log[len(self.log) - 1]
-                key = str(entry[1])
-                val = str(entry[2])
-                # print('adding to data ', key, val)
-                self.data[key] = val # COMMIT IT
-                
-                # self.MIDs[len(self.log) - 1] = {
-                #   'MID': msg["MID"],
-                #   'client': msg["src"],
-                # }
+                # commit it by adding it to our data dict
+                self.data[entry[1]] = entry[2] 
+                print('now data = ', self.data)
+
+                # tell the client we've committed their put()
                 put_ok = {
                     "src": self.id, 
-                    "dst": self.MIDs[msg['key']]['client'], 
+                    "dst": self.curr_client,
                     "leader": self.id, 
                     "type": "ok", 
-                    "MID": self.MIDs[msg['key']]['MID']
+                    "MID": self.curr_mid,
                     }
                 self.send(put_ok)
                 self.commitIndex += 1
                 self.awaiting_majority = False
                 self.successes = 0  # reset successes counter
 
+                # if more put()s are in the queue
                 if self.puts_queue != []:
-                    self.send_append_entries(index_of_entry = self.puts_queue[0]) # send first in queue
-                    self.successes = 0  # reset successes counter
-                    self.puts_queue.pop(0) # remove from queue
-                    self.awaiting_majority = True
+                    next_put_msg = self.puts_queue[0]
+                    self.puts_queue.remove(next_put_msg)
+                    self.puts_logic(next_put_msg)         # kick off next put() 
+
         else:
             # otherwise decrement index and try again
             return
 
     def handle_put(self, msg):
+        print('\n\n PUT()')
         # if client doesn't know who leader is
         if msg['leader'] == BROADCAST or msg['leader'] != self.leader_id:
             print('\n REDIRECT. TELLING CLIENT ABOUT LEADER')
@@ -345,33 +345,45 @@ class Replica:
                 "src": self.id, 
                 "dst": msg["src"],
                 "leader": self.leader_id,
-                "type": "redirect", 
+                "type": "redirect",
                 "MID": msg['MID']
                 }
             self.send(redirect)
             return
-        # otherwise, if we are the leader, append to log and send appendEntries to followers
+        # otherwise, if we are the leader, append to log and tell replicas
         if msg['leader'] == self.leader_id and self.state == State.LEADER:
-            print('\n LEADER GOT PUT')
-            entry = [self.term, msg["key"], msg["value"]]
-            self.log.append(entry)
-            # print('\n LOG IS NOW : ', self.log)
-            if not self.awaiting_majority:
-                self.send_append_entries(index_of_entry = len(self.log) - 1)
-                self.awaiting_majority = True
-            else:
-                self.puts_queue.append(len(self.log) - 1)
+            # if we have not yet responded to the current put(), add this put() to queue
+            if self.awaiting_majority:
+                self.puts_queue.append(msg)
+                return
+            self.puts_logic(msg)                
 
-            self.MIDs[msg["key"]] = {
-                'MID': msg["MID"],
-                'client': msg["src"],
-            }
+    # leader logic for informing replicas about put() from client
+    def puts_logic(self, msg):
+        # duplicate put()?
+        if self.curr_k_v == [msg["key"], msg["value"]]:
+            return
+
+        # 1. keep track of MID and client for our response
+        self.curr_mid = msg['MID']
+        self.curr_client = msg['src']
+
+        # 2. form the new log entry
+        entry = [self.term, msg["key"], msg["value"]]
+        self.log.append(entry)
+
+        # 3. inform replicas, wait for majority successes
+        self.send_append_entries()
+        self.awaiting_majority = True
+        
 
     def handle_get(self, msg):
-        print('\n\n LEADER GOT GET')
+        print('\n\n\n\n GET()')
         # {"src": "<ID>", "dst": "<ID>", "leader": "<ID>", "type": "get", "MID": "<a unique string>", key": "<some key>"}
         if msg["key"] in self.data.keys():
-            val = self.data[msg["key"]]
+            val = self.data[msg["key"]]  # THE PROBLEM
+            print('\n data is:', self.data)
+            print('\n the val is:', val)
 
             get_ok = {
                 "src": self.id, 
