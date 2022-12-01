@@ -2,6 +2,7 @@
 
 import argparse, socket, time, json, select, struct, sys, math, os, random
 import enum
+from webbrowser import get
 
 BROADCAST = "FFFF"
 HEARTBEAT_PERIOD = .140 # leader should send heartbeat every 140ms
@@ -17,7 +18,7 @@ class Replica:
     term = 0
     state = State.FOLLOWER
     log = []        # list of lists, where each is an entry in the form [term, k, v]
-    data = None     # dict of (k, v) pairs
+    data = {}     # dict of (k, v) pairs
     leader_id = BROADCAST
     timer_start = 0
 
@@ -32,6 +33,7 @@ class Replica:
     puts_queue = []
     successes = 0
     awaiting_majority = False
+    MIDs = {}
 
     def __init__(self, port, id, others):
         self.port = port
@@ -140,7 +142,7 @@ class Replica:
     # if we are the leader, check whether we need to send a heartbeat message
     def check_heartbeat(self):
         if time.time() > (self.time_last_msg_sent + HEARTBEAT_PERIOD):
-            print('leader ' + str(self.id) + ' sending heartbeat')
+            # print('leader ' + str(self.id) + ' sending heartbeat')
             self.send_append_entries(heartbeat = True)
 
     def getterm(self, entry):
@@ -196,14 +198,13 @@ class Replica:
         leader = msg["src"]
         entries = msg['entries']
         if self.leader_id == BROADCAST:
-            print(leader, " declared themselves leader")
             self.state = State.FOLLOWER
             self.leader_id = leader
             self.voted_for = None
             self.my_voters = [] # in case you had also been running for election
         
         if entries == []:
-            print('\nGOT HEARTBEAT')
+            print('\nHEARTBEAT')
             return
 
         print('\nGOT AE')
@@ -219,15 +220,14 @@ class Replica:
         #     # 2. Reply false if log doesn’t contain an entry at prevLogIndex whose term matches prevLogTerm (§5.3)
         #     if self.log[prev_log_i] is None or (self.log[prev_log_i][0] != prev_log_term):
         #         valid = False
-        print('responding to leader...')
-        # send responses
+        key = entries[0][1]
         ae_res = { 
             "src": self.id, 
             "dst": leader, 
             "leader": leader,
             "type": "ae_res",
             "term": self.term,
-            "index": msg["prev_log_i"],
+            "key": key,
             "success": "true" if valid else "false"
             }
         self.send(ae_res)
@@ -252,7 +252,7 @@ class Replica:
                     # recv
                     data, addr = self.socket.recvfrom(65535)
                     msg = json.loads(data.decode('utf-8'))
-                    print("Received message '%s'" % (data.decode('utf-8'),), flush=True)
+                    #print("Received message '%s'" % (data.decode('utf-8'),), flush=True)
                     mtype = msg['type']
                     src = msg['src']
 
@@ -295,8 +295,26 @@ class Replica:
         success = msg["success"]
         if success:
             self.successes += 1
-            if self.successes >= 3:
+            if self.successes >= 2:
                 print('GOT ALL SUCCESSES, committing index', self.commitIndex)
+                entry = self.log[len(self.log) - 1]
+                key = str(entry[1])
+                val = str(entry[2])
+                # print('adding to data ', key, val)
+                self.data[key] = val # COMMIT IT
+                
+                # self.MIDs[len(self.log) - 1] = {
+                #   'MID': msg["MID"],
+                #   'client': msg["src"],
+                # }
+                put_ok = {
+                    "src": self.id, 
+                    "dst": self.MIDs[msg['key']]['client'], 
+                    "leader": self.id, 
+                    "type": "ok", 
+                    "MID": self.MIDs[msg['key']]['MID']
+                    }
+                self.send(put_ok)
                 self.commitIndex += 1
                 self.awaiting_majority = False
                 if self.puts_queue != []:
@@ -326,15 +344,42 @@ class Replica:
             print('\n LEADER GOT PUT')
             entry = [self.term, msg["key"], msg["value"]]
             self.log.append(entry)
-            print('\n LOG IS NOW : ', self.log)
+            # print('\n LOG IS NOW : ', self.log)
             if not self.awaiting_majority:
                 self.send_append_entries(index_of_entry = len(self.log) - 1)
                 self.awaiting_majority = True
             else:
                 self.puts_queue.append(len(self.log) - 1)
 
+            self.MIDs[msg["key"]] = {
+                'MID': msg["MID"],
+                'client': msg["src"],
+            }
+
     def handle_get(self, msg):
-        return
+        print('\n\n LEADER GOT GET')
+        # {"src": "<ID>", "dst": "<ID>", "leader": "<ID>", "type": "get", "MID": "<a unique string>", key": "<some key>"}
+        if msg["key"] in self.data.keys():
+            val = self.data[msg["key"]]
+
+            get_ok = {
+                "src": self.id, 
+                "dst": msg["src"], 
+                "leader": self.id, 
+                "type": "ok", 
+                "MID": msg["MID"],
+                "value": val
+                }
+            self.send(get_ok)
+        else:
+            get_failure = {
+                "src": self.id, 
+                "dst": msg["src"], 
+                "leader": self.id, 
+                "type": "fail", 
+                "MID": msg["MID"]
+                }
+            self.send(get_failure)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='run a key-value store')
