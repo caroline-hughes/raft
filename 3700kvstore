@@ -129,10 +129,29 @@ class Replica:
             self.voted = True
             self.send(rv)
             self.my_voters = [self.id]
+            self.TIMEOUT = random.randrange(150, 300) / 1000
             self.timer_start = time.time()
             
         if time.time() > (self.timer_start + self.TIMEOUT) and self.state == State.CANDIDATE:
-            print('election timed out')
+            print('ELECTION TIMED OUT')
+            self.term += 1
+
+            last_i = len(self.log) - 1
+            last_term = -1 if self.log == [] else self.log[last_i][0]
+            rv = {
+                "src": self.id,
+                "dst": BROADCAST,
+                "leader": BROADCAST,
+                "type": "rv",
+                "term": self.term,
+                "last_i": last_i,  # index of last log entry
+                "last_term": last_term  # term of that entry
+            }
+            self.voted = True
+            self.send(rv)
+            self.my_voters = [self.id]
+            self.TIMEOUT = random.randrange(150, 300) / 1000
+            self.timer_start = time.time()
 
     # if leader, monitor heartbeat
     def check_heartbeat(self):
