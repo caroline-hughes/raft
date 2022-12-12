@@ -22,7 +22,8 @@ class Replica:
     
     # if follower, timer tracks last time we heard from leader
     # if leader, timer tracks last time we sent an appendEntries
-    timer_start = 0  
+    timer_start = 0
+    put_timer = 0
 
     # candidate fields:
     my_voters = []  # our votees
@@ -44,6 +45,7 @@ class Replica:
 
     commitIndex = -1           # the index of the committed entry in log
     nextIndexes = [0,0,0,0,0]  # TODO
+    curr_put = None
     
 
     def __init__(self, port, id, others):
@@ -73,12 +75,13 @@ class Replica:
 
         if self.state != State.LEADER:
             self.election = True
-            self.leader_id = BROADCAST
+            # self.leader_id = BROADCAST
             src = json_msg['src']
             valid = True
 
+
             # 1. Reply false if term < currentTerm (§5.1)
-            if json_msg['term'] < self.term:
+            if json_msg['term'] <= self.term:
                 valid = False
 
             # 2. Cannot vote twice (§5.2)
@@ -88,10 +91,14 @@ class Replica:
             # 3. If candidate’s log is at least as up-to-date as receiver’s log, grant vote (§5.4)
             # ie. it is guaranteed that the election winner will have most up to date logs
             src_last_i = json_msg['last_i']
+            print("SRC_LAST_I", src_last_i)
             src_last_term = json_msg['last_term']
+            print("SRC LAST TERM", src_last_term)
 
             last_i = len(self.log) - 1
+            print("LAST_I", last_i)
             last_term = -1 if self.log == [] else self.log[last_i][0]
+            print("LAST_TERM", last_term)
 
             # print('LAST_I ', last_i)
             # print('SRC_LAST_I ', src_last_i)
@@ -100,10 +107,14 @@ class Replica:
             if src_last_i < last_i or src_last_term < last_term:
                 valid = False
 
+            if valid:
+                self.leader_id = BROADCAST
+
+
             votemsg = {
                 "src": self.id,
                 "dst": src,
-                "leader": BROADCAST,
+                "leader": BROADCAST if valid else self.leader_id,
                 "type": "vote",
                 "vote": 'true' if valid else 'false',
                 "cand_id": src,
@@ -248,12 +259,25 @@ class Replica:
             valid = True
 
             # 1. Reply false if term < currentTerm (§5.1)
-            if int(msg["term"]) < self.term:
+            #if int(msg["term"]) < self.term:
+            #    valid = False
+
+            prev_log_i = int(msg["prev_log_i"])  # -1 if leaders log len < 2
+            #prev_log_term = int(msg["prev_log_term"]) # -1 if leaders log len < 2
+
+            self_prev_log_i = len(self.log) - 1  # last index in log
+           # self_prev_log_term = -1 if len(self.log) <= 1 else self.log[self_prev_log_i][0]
+
+           # if self_prev_log_term != prev_log_term:
+             #   valid = False
+
+            if self_prev_log_i > prev_log_i:
                 valid = False
 
-            self.log.append(entries)
-            self.data[entries[0][1]] = entries[0][2]
-            self.commitIndex = msg["prev_log_i"] +1
+            if valid:
+                self.log.append(entries)
+                self.data[entries[0][1]] = entries[0][2]
+                self.commitIndex = msg["prev_log_i"] + 1
             # prev_log_i = int(msg["prev_log_i"]) # -1 if leaders log len < 2
             # prev_log_term = int(msg["prev_log_term"]) # -1 if leaders log len < 2
             # if prev_log_i != -1:
@@ -268,7 +292,7 @@ class Replica:
                 "type": "ae_res",
                 "term": self.term,
                 "index": msg["prev_log_i"],
-                "success": "true" if valid else "false"
+                "success": "True" if valid else "False"
                 }
             self.send(ae_res)
 
@@ -350,13 +374,17 @@ class Replica:
                         self.check_timeout()
                     if self.state == State.LEADER:
                         self.check_heartbeat()
+                        if self.awaiting_majority and time.time() > (self.put_timer + 50/1000):
+                            self.send_append_entries()
+                            self.put_timer = time.time()
+
 
     # handle success or failure response from follower after an appendEntries RPC
     def got_ae_res(self, msg):
         success = msg["success"]
 
         index = msg['index']
-        if success and index == self.commitIndex:
+        if success == "True" and index == self.commitIndex:
             self.successes += 1
             if self.successes >= 2:
                 print('\n\nGOT MAJORITY, committing log at index', self.commitIndex)
@@ -384,7 +412,7 @@ class Replica:
                     self.puts_queue.remove(next_put_msg)
                     self.puts_logic(next_put_msg)         # kick off next put() 
 
-        elif success is None:
+        elif success == "False":
             # TODO: otherwise decrement index and try again
             print("\n\n RECEIVED A FAILURE")
             print(self.commitIndex)
@@ -427,6 +455,7 @@ class Replica:
             # 1. keep track of MID and client for our response
             self.curr_mid = msg['MID']
             self.curr_client = msg['src']
+            self.curr_put = msg
 
             # 2. form the new log entry
             entry = [self.term, msg["key"], msg["value"]]
@@ -435,6 +464,7 @@ class Replica:
             # 3. inform replicas, wait for majority successes
             self.send_append_entries()
             self.awaiting_majority = True
+            self.put_timer = time.time()
         
 
     def handle_get(self, msg):
