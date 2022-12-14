@@ -73,7 +73,7 @@ class Replica:
                 if reader is self.socket:
                     data, addr = self.socket.recvfrom(65535)
                     msg = json.loads(data.decode('utf-8'))
-                    print("Received message '%s'" % (data.decode('utf-8'),), flush=True)
+                    # print("Received message '%s'" % (data.decode('utf-8'),), flush=True)
                     mtype = msg['type']
 
                     # handle a requestVote RPC
