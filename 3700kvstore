@@ -73,8 +73,6 @@ class Replica:
                     mtype = msg['type']
                     src = msg['src']
 
-                    # Does this logic also go within here? it involves send()s ....
-
                     # handle a requestVote RPC
                     if mtype == "rv":
                         self.got_request_vote(msg)
